@@ -1005,6 +1005,69 @@ def test_large_cross_product_memory_usage():
         mock_get_partition_keys.assert_not_called()
 
 
+def test_paginated_partition_keys_skip_invalid_dynamic_dimension_keys():
+    """Pagination drops dynamic keys that contain the multipartition delimiter.
+
+    get_partition_keys filters those keys with is_valid_key_format. The paginated
+    path has to do the same while still filling each page up to the limit and
+    resuming from the cursor.
+    """
+    partitions_def = dg.MultiPartitionsDefinition(
+        {
+            "customer": dg.DynamicPartitionsDefinition(name="customers"),
+            "table": dg.StaticPartitionsDefinition(["orders", "items"]),
+        }
+    )
+
+    with dg.instance_for_test() as instance:
+        instance.add_dynamic_partitions(
+            "customers",
+            ["customer-east", "customer|west", "customer-north", "customer|south"],
+        )
+        context = PartitionLoadingContext(
+            temporal_context=TemporalContext(effective_dt=datetime.now(), last_event_id=None),
+            dynamic_partitions_store=instance,
+        )
+        expected = list(partitions_def.get_partition_keys(dynamic_partitions_store=instance))
+        assert len(expected) == 4
+        assert {key.keys_by_dimension["customer"] for key in expected} == {
+            "customer-east",
+            "customer-north",
+        }
+        assert all(partitions_def.is_valid_key_format(key) for key in expected)
+
+        def collect(ascending: bool, limit: int) -> list[str]:
+            collected: list[str] = []
+            cursor = None
+            has_more = True
+            pages = 0
+            while has_more:
+                page = partitions_def.get_paginated_partition_keys(
+                    context=context,
+                    limit=limit,
+                    ascending=ascending,
+                    cursor=cursor,
+                )
+                assert page.results
+                assert all(partitions_def.is_valid_key_format(key) for key in page.results)
+                if page.has_more:
+                    assert len(page.results) == limit
+                for key in page.results:
+                    partitions_def.get_partition_key_from_str(str(key))
+                collected.extend(page.results)
+                cursor = page.cursor
+                has_more = page.has_more
+                pages += 1
+                assert pages < 20
+            return collected
+
+        # limit=3 forces the invalid dynamic key into the middle of the first page
+        assert collect(ascending=True, limit=3) == expected
+        assert collect(ascending=False, limit=3) == list(reversed(expected))
+        assert collect(ascending=True, limit=1) == expected
+        assert collect(ascending=False, limit=1) == list(reversed(expected))
+
+
 @pytest.mark.parametrize(
     "key, expected",
     [

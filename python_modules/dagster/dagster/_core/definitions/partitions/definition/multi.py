@@ -278,22 +278,34 @@ class MultiPartitionsDefinition(PartitionsDefinition[MultiPartitionKey]):
                 ascending=ascending,
             )
             next_cursor = cursor
+            has_more = False
             while iterator.has_next():
                 partition_key = next(iterator)
                 if not partition_key:
+                    has_more = iterator.has_next()
+                    break
+
+                # Dimension keys can contain the multipartition delimiter. Those
+                # combinations are not valid multi-partition keys; get_partition_keys
+                # drops them. Skip them here and move the cursor past them so a page
+                # still fills to `limit` and does not resume inside the skipped run.
+                if not self.is_valid_key_format(partition_key):
+                    next_cursor = iterator.cursor().to_string()
+                    continue
+
+                if partition_keys and len(partition_keys) >= limit:
+                    # This valid key belongs on the next page. Leave the cursor on the
+                    # previous key so the next call yields it again.
+                    has_more = True
                     break
 
                 partition_keys.append(partition_key)
                 next_cursor = iterator.cursor().to_string()
-                if len(partition_keys) >= limit:
-                    break
 
             if not next_cursor:
                 next_cursor = MultiPartitionCursor(last_seen_key=None).to_string()
 
-            return PaginatedResults(
-                results=partition_keys, cursor=next_cursor, has_more=iterator.has_next()
-            )
+            return PaginatedResults(results=partition_keys, cursor=next_cursor, has_more=has_more)
 
     def is_valid_key_format(self, partition_key: str) -> bool:
         """Checks if the given partition key is in the correct format for a multi-partition key
